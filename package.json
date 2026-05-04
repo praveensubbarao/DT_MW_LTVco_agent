@@ -1,0 +1,33 @@
+{
+  "name": "dt-mw-ltv-co-agent",
+  "version": "1.0.0",
+  "description": "Production-grade Playwright + TypeScript E2E test framework",
+  "type": "module",
+  "scripts": {
+    "test": "npx playwright test",
+    "test:headed": "npx playwright test --headed",
+    "test:desktop": "npx playwright test --project=desktop-chrome",
+    "test:tablet": "npx playwright test --project=tablet-chrome",
+    "test:mobile": "npx playwright test --project=mobile-chrome",
+    "test:mobile-small": "npx playwright test --project=mobile-small",
+    "test:responsive": "npx playwright test --project=desktop-chrome --project=tablet-chrome --project=mobile-chrome --project=mobile-small",
+    "test:retry-failed": "npx playwright test --last-failed",
+    "generate:test": "tsx agent/testOrchestration.ts",
+    "install:browsers": "npx playwright install",
+    "format": "prettier --write .",
+    "precommit": "node ./scripts/validate-spec-comments.js"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^0.24.0",
+    "@playwright/test": "^1.40.0",
+    "chrome-launcher": "^0.15.2",
+    "lighthouse": "^11.4.0",
+    "openai": "^4.52.0",
+    "prettier": "^3.1.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
