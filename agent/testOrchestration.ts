@@ -1,18 +1,18 @@
 #!/usr/bin/env tsx
 /**
- * testOrchestration — AI-powered Playwright test generator
+ * testOrchestration — AI-powered Playwright test generator (agentic loop)
  *
  * Usage:
  *   echo "<feature context>" | npm run generate:test
  *   npm run generate:test < feature.txt
  *   cat feature.json | npm run generate:test
  *
- * Reads feature context from stdin (plain text or JSON), calls Claude to
- * generate a Playwright test file, writes it to src/tests/{featureName}/,
- * validates the output, and reports the result.
+ * The agent writes the spec, runs tests, reads failures, and self-corrects
+ * until all tests pass or MAX_ITERATIONS is reached.
  */
 import Anthropic from '@anthropic-ai/sdk';
 import { readFileSync, mkdirSync, writeFileSync } from 'fs';
+import { execSync } from 'child_process';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -33,11 +33,11 @@ interface FeatureContext {
 }
 
 interface GenerationResult {
-  filePath: string;
+  filePaths: string[];
   testCount: number;
   deviceCoverage: string[];
   validationStatus: 'PASSED' | 'WARNINGS' | 'FAILED';
-  nextSteps: string[];
+  iterations: number;
   warnings: string[];
 }
 
@@ -46,8 +46,105 @@ interface GenerationResult {
 const DEFAULT_DEVICES = ['desktop-chrome', 'tablet-chrome', 'mobile-chrome', 'mobile-small'];
 const VALID_DEVICES = new Set(DEFAULT_DEVICES);
 const VALID_STACKS = new Set<string>(['dev', 'stg', 'prod']);
+const MAX_ITERATIONS = 10;
 
-// ─── System prompt ────────────────────────────────────────────────────────────
+// ─── Tools ────────────────────────────────────────────────────────────────────
+
+const TOOLS: Anthropic.Tool[] = [
+  {
+    name: 'write_file',
+    description:
+      'Write content to a file, creating parent directories as needed. Use this to write the Playwright spec file — never output code in prose.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        path: {
+          type: 'string',
+          description:
+            'File path relative to project root (e.g. src/tests/my-feature/my-feature.spec.ts)',
+        },
+        content: { type: 'string', description: 'Full file content to write' },
+      },
+      required: ['path', 'content'],
+    },
+  },
+  {
+    name: 'run_tests',
+    description:
+      'Run Playwright tests and return the full output including pass/fail results. Use after writing the spec to verify it.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        grep: {
+          type: 'string',
+          description: 'Optional test name filter (--grep value)',
+        },
+        project: {
+          type: 'string',
+          description: 'Device profile to run against (default: desktop-chrome)',
+          enum: ['desktop-chrome', 'tablet-chrome', 'mobile-chrome', 'mobile-small'],
+        },
+      },
+    },
+  },
+  {
+    name: 'read_file',
+    description: 'Read an existing file — useful for inspecting an existing spec or fixture before generating.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        path: { type: 'string', description: 'File path relative to project root' },
+      },
+      required: ['path'],
+    },
+  },
+];
+
+// ─── Tool executor ────────────────────────────────────────────────────────────
+
+function executeTool(
+  name: string,
+  input: Record<string, string>,
+  writtenFiles: string[]
+): string {
+  switch (name) {
+    case 'write_file': {
+      const abs = join(PROJECT_ROOT, input.path);
+      mkdirSync(dirname(abs), { recursive: true });
+      writeFileSync(abs, input.content, 'utf-8');
+      writtenFiles.push(input.path);
+      return `Written: ${input.path}`;
+    }
+
+    case 'run_tests': {
+      const grep = input.grep ? `--grep "${input.grep}"` : '';
+      const project = input.project ? `--project=${input.project}` : '--project=desktop-chrome';
+      try {
+        return execSync(`npx playwright test ${grep} ${project} --reporter=line`, {
+          cwd: PROJECT_ROOT,
+          timeout: 120_000,
+          encoding: 'utf-8',
+          stdio: 'pipe',
+        });
+      } catch (err: any) {
+        return ((err.stdout as string) ?? '') + ((err.stderr as string) ?? '') || err.message;
+      }
+    }
+
+    case 'read_file': {
+      try {
+        return readFileSync(join(PROJECT_ROOT, input.path), 'utf-8');
+      } catch {
+        return `File not found: ${input.path}`;
+      }
+    }
+
+    default:
+      return `Unknown tool: ${name}`;
+  }
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function loadSystemPrompt(): string {
   const promptPath = join(__dirname, '.test-generation-instructions.md');
@@ -57,8 +154,6 @@ function loadSystemPrompt(): string {
     throw new Error('System prompt not found at agent/.test-generation-instructions.md');
   }
 }
-
-// ─── Formatting ───────────────────────────────────────────────────────────────
 
 function formatFeatureContext(ctx: FeatureContext): string {
   const parts: string[] = [
@@ -85,38 +180,143 @@ function formatFeatureContext(ctx: FeatureContext): string {
   return parts.join('\n');
 }
 
-// ─── Code extraction & validation ─────────────────────────────────────────────
-
-function extractTypeScriptCode(text: string): string {
-  const match = text.match(/```typescript\n([\s\S]*?)```/);
-  return match ? match[1].trim() : text.trim();
+function countTestsInFile(filePath: string): number {
+  try {
+    const content = readFileSync(join(PROJECT_ROOT, filePath), 'utf-8');
+    return (content.match(/\btest\(/g) ?? []).length;
+  } catch {
+    return 0;
+  }
 }
 
-function countTests(code: string): number {
-  return (code.match(/\btest\(/g) ?? []).length;
+function summarizeInput(input: Record<string, string>): string {
+  const [key, val] = Object.entries(input)[0] ?? ['', ''];
+  const v = String(val);
+  return `${key}: "${v.slice(0, 40)}${v.length > 40 ? '…' : ''}"`;
 }
 
-function validateTestCode(code: string): { status: 'PASSED' | 'WARNINGS' | 'FAILED'; warnings: string[] } {
+function testsPassed(output: string): boolean {
+  return /\d+ passed/.test(output) && !/\d+ failed/.test(output);
+}
+
+// ─── Agentic loop ─────────────────────────────────────────────────────────────
+
+async function generateTest(context: FeatureContext): Promise<GenerationResult> {
+  const client = new Anthropic();
+  const systemPrompt = loadSystemPrompt();
+  const deviceCoverage = context.deviceProfiles?.length ? context.deviceProfiles : DEFAULT_DEVICES;
+
+  console.log(`\nGenerating: ${context.featureName}`);
+  console.log(`Devices:    ${deviceCoverage.join(', ')}\n`);
+
+  const messages: Anthropic.MessageParam[] = [
+    { role: 'user', content: formatFeatureContext(context) },
+  ];
+
+  const writtenFiles: string[] = [];
   const warnings: string[] = [];
-  const testCount = countTests(code);
+  let iterations = 0;
+  let lastRunPassed = false;
 
-  if (testCount === 0) {
-    return { status: 'FAILED', warnings: ['No test() blocks found in generated code'] };
+  while (iterations++ < MAX_ITERATIONS) {
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 8096,
+      system: systemPrompt,
+      tools: TOOLS,
+      messages,
+    });
+
+    messages.push({ role: 'assistant', content: response.content });
+
+    for (const block of response.content) {
+      if (block.type === 'text' && block.text.trim()) {
+        process.stdout.write(`\n[agent] ${block.text.trim()}\n`);
+      }
+    }
+
+    if (response.stop_reason === 'end_turn') break;
+
+    const toolResults: Anthropic.ToolResultBlockParam[] = [];
+
+    for (const block of response.content) {
+      if (block.type !== 'tool_use') continue;
+
+      process.stdout.write(`  [${iterations}] ${block.name}(${summarizeInput(block.input as Record<string, string>)})`);
+
+      const result = executeTool(
+        block.name,
+        block.input as Record<string, string>,
+        writtenFiles
+      );
+
+      if (block.name === 'run_tests') {
+        lastRunPassed = testsPassed(result);
+        const statusLine = result.split('\n').find((l) => /passed|failed/.test(l))?.trim() ?? '';
+        process.stdout.write(` → ${lastRunPassed ? '✓' : '✗'} ${statusLine}\n`);
+      } else {
+        process.stdout.write(` → ${result.split('\n')[0].slice(0, 80)}\n`);
+      }
+
+      toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: result });
+    }
+
+    messages.push({ role: 'user', content: toolResults });
   }
 
-  // Verify // Steps: appears before each test()
-  const stepsBeforeTest = (code.match(/\/\/ Steps:[\s\S]*?\n\s*test\(/g) ?? []).length;
-  if (stepsBeforeTest < testCount) {
-    warnings.push(
-      `${testCount - stepsBeforeTest} test(s) missing // Steps: comment (required by precommit hook)`
-    );
+  if (iterations > MAX_ITERATIONS) {
+    warnings.push(`Reached max iterations (${MAX_ITERATIONS}) without all tests passing`);
   }
 
-  if (!code.includes("from '@/utils/fixtures/appBaseTest'")) {
-    warnings.push("Import from '@/utils/fixtures/appBaseTest' not found — verify import path");
+  const uniqueFiles = [...new Set(writtenFiles)];
+  const testCount = uniqueFiles.reduce((sum, f) => sum + countTestsInFile(f), 0);
+
+  let validationStatus: GenerationResult['validationStatus'];
+  if (lastRunPassed) {
+    validationStatus = 'PASSED';
+  } else if (uniqueFiles.length > 0) {
+    validationStatus = 'WARNINGS';
+  } else {
+    validationStatus = 'FAILED';
   }
 
-  return { status: warnings.length > 0 ? 'WARNINGS' : 'PASSED', warnings };
+  return { filePaths: uniqueFiles, testCount, deviceCoverage, validationStatus, iterations, warnings };
+}
+
+// ─── Output ───────────────────────────────────────────────────────────────────
+
+function printResult(result: GenerationResult): void {
+  const icon = { PASSED: '✓', WARNINGS: '⚠', FAILED: '✗' }[result.validationStatus];
+  const line = '─'.repeat(56);
+
+  console.log(`\n${line}`);
+  result.filePaths.forEach((f) => console.log(` ${icon} ${result.validationStatus}: ${f}`));
+  console.log(`   Tests:      ${result.testCount}`);
+  console.log(`   Devices:    ${result.deviceCoverage.join(', ')}`);
+  console.log(`   Iterations: ${result.iterations}`);
+
+  if (result.warnings.length > 0) {
+    console.log('\n  Warnings:');
+    result.warnings.forEach((w) => console.log(`    - ${w}`));
+  }
+
+  console.log('\n  Run:');
+  console.log('    1. npm test --project=desktop-chrome');
+  console.log('    2. npm test');
+  console.log('    3. npx playwright show-report');
+  console.log(`${line}\n`);
+}
+
+// ─── Stdin ────────────────────────────────────────────────────────────────────
+
+async function readStdin(): Promise<string> {
+  if (process.stdin.isTTY) return '';
+  return new Promise((resolve) => {
+    let data = '';
+    process.stdin.setEncoding('utf-8');
+    process.stdin.on('data', (chunk: string) => (data += chunk));
+    process.stdin.on('end', () => resolve(data.trim()));
+  });
 }
 
 // ─── Input parsing ────────────────────────────────────────────────────────────
@@ -163,98 +363,28 @@ function parseFeatureText(text: string): FeatureContext {
     try {
       ctx.selectors = JSON.parse(selectorBuffer.replace(/'/g, '"')) as Record<string, string>;
     } catch {
-      // Selectors are optional — ignore parse failures
+      // Selectors are optional
     }
   }
 
   return ctx as FeatureContext;
 }
 
-// ─── Core generation ──────────────────────────────────────────────────────────
-
-async function generateTest(context: FeatureContext): Promise<GenerationResult> {
-  const client = new Anthropic();
-  const systemPrompt = loadSystemPrompt();
-  const deviceCoverage = context.deviceProfiles?.length ? context.deviceProfiles : DEFAULT_DEVICES;
-
-  console.log(`\nGenerating: ${context.featureName}`);
-  console.log(`Devices:    ${deviceCoverage.join(', ')}\n`);
-
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 4096,
-    system: systemPrompt,
-    messages: [{ role: 'user', content: formatFeatureContext(context) }],
-  });
-
-  const content = response.content[0];
-  if (content.type !== 'text') throw new Error('Unexpected response type from Claude API');
-
-  const testCode = extractTypeScriptCode(content.text);
-  const { status: validationStatus, warnings } = validateTestCode(testCode);
-
-  const featureDir = join(PROJECT_ROOT, 'src', 'tests', context.featureName);
-  const relPath = `src/tests/${context.featureName}/${context.featureName}.spec.ts`;
-
-  mkdirSync(featureDir, { recursive: true });
-  writeFileSync(join(featureDir, `${context.featureName}.spec.ts`), testCode, 'utf-8');
-
-  return {
-    filePath: relPath,
-    testCount: countTests(testCode),
-    deviceCoverage,
-    validationStatus,
-    nextSteps: [
-      `npm test --project=desktop-chrome`,
-      `npm test`,
-      `npx playwright show-report`,
-    ],
-    warnings,
-  };
-}
-
-// ─── Output ───────────────────────────────────────────────────────────────────
-
-function printResult(result: GenerationResult): void {
-  const icon = { PASSED: '✓', WARNINGS: '⚠', FAILED: '✗' }[result.validationStatus];
-  const line = '─'.repeat(56);
-
-  console.log(`\n${line}`);
-  console.log(` ${icon} ${result.validationStatus}: ${result.filePath}`);
-  console.log(`   Tests:   ${result.testCount}`);
-  console.log(`   Devices: ${result.deviceCoverage.join(', ')}`);
-
-  if (result.warnings.length > 0) {
-    console.log('\n  Warnings:');
-    result.warnings.forEach((w) => console.log(`    - ${w}`));
-  }
-
-  console.log('\n  Run:');
-  result.nextSteps.forEach((s, i) => console.log(`    ${i + 1}. ${s}`));
-  console.log(`${line}\n`);
-}
-
-// ─── Stdin ────────────────────────────────────────────────────────────────────
-
-async function readStdin(): Promise<string> {
-  if (process.stdin.isTTY) return '';
-  return new Promise((resolve) => {
-    let data = '';
-    process.stdin.setEncoding('utf-8');
-    process.stdin.on('data', (chunk: string) => (data += chunk));
-    process.stdin.on('end', () => resolve(data.trim()));
-  });
-}
-
 // ─── Help ─────────────────────────────────────────────────────────────────────
 
 const HELP = `
-testOrchestration — AI-powered Playwright test generator
+testOrchestration — AI-powered Playwright test generator (agentic loop)
 
 Usage:
   echo "<feature context>" | npm run generate:test
   npm run generate:test < feature.txt
   cat feature.json | npm run generate:test
+
+The agent will:
+  1. Write the Playwright spec file
+  2. Run tests automatically (desktop-chrome)
+  3. Read failures and self-correct
+  4. Repeat until all tests pass or max iterations reached
 
 Feature Context Format (plain text):
   Feature: feature-name

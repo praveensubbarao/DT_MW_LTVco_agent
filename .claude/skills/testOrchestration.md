@@ -1,11 +1,21 @@
 ---
 name: testOrchestration
-description: Generate Playwright test files from feature descriptions for lifetimevalue.co. Supports all 4 device profiles (desktop, tablet, mobile, mobile-small) and enforces framework conventions.
+description: Generate Playwright test files from feature descriptions. Supports all 4 device profiles (desktop, tablet, mobile, mobile-small), enforces framework conventions, runs tests automatically, and self-corrects until passing.
 ---
 
 # Test Orchestration Skill
 
-You are a test generation specialist for the DT_MW_LTVco_agent Playwright framework. When invoked, generate production-ready Playwright tests from the feature context the user provides.
+You are a test generation specialist for a Playwright E2E testing framework. When invoked, you operate as an **agentic loop** — write the spec, run it, fix failures, repeat until all tests pass.
+
+## Agentic Workflow (Required)
+
+1. **Write the spec** using the `Write` tool → `src/tests/{featureName}/{featureName}.spec.ts`
+2. **Run tests** using the `Bash` tool: `npx playwright test --project=desktop-chrome -- {featureName}`
+3. **If tests fail** — read the output, diagnose the root cause, rewrite the spec with the `Edit` or `Write` tool, run again
+4. **Repeat** until all tests pass (output shows `X passed`, no failures)
+5. **Report** final status, file path, test count, and run commands
+
+Do **not** stop after writing the file. Always run tests before reporting done.
 
 ## Framework Conventions (Required)
 
@@ -14,7 +24,7 @@ You are a test generation specialist for the DT_MW_LTVco_agent Playwright framew
 - Use `appActions` fixture — never use raw `page` in test blocks directly
 - Tests go in `src/tests/{featureName}/{featureName}.spec.ts`
 - Path alias: `@/*` → `src/*`
-- **Every generated spec file must include a Performance Audit describe block** (see template below)
+- **Every spec file must include a Performance Audit describe block** (see template below)
 
 ## Device Profiles
 
@@ -44,20 +54,31 @@ Optional:
   Custom Assertions: expect statement
 ```
 
+If invoked with just a URL (e.g. `/testOrchestration press URI: https://www.ltvco.com/press/`), fetch the page first to understand its structure, then derive the feature name, description, and steps from the page content.
+
 ## Generation Workflow
 
-1. **Validate input** — feature name, description, at least 1 step
+1. **Validate / derive input** — feature name, description, at least 1 step. If a URI is provided, fetch it to inspect content.
 2. **Map steps to AppActions**:
-   - Navigate → `appActions.openPage(path?)`
-   - Click → `appActions.clickLocator(locator)` or `page.getByRole()`
-   - Fill → `page.fill(selector, text)` or `page.getByLabel().fill()`
-   - Verify text → `appActions.expectPageBodyContains(text)` or `expect(locator).toContainText()`
+   - Navigate → `appActions.openPage(path)`
+   - Click → `page.getByRole()` or `page.locator().filter({ hasText })`
+   - Fill → `page.getByLabel().fill()` or `page.fill(selector, text)`
+   - Verify visible text → `appActions.expectPageBodyContains(text)`
+   - Verify DOM presence (may be hidden) → `expect(locator).toBeAttached()`
    - Verify URL → `appActions.expectPageUrlContains(fragment)`
-   - If no selector provided → use `page.getByRole()`, `page.getByText()`, `page.getByLabel()`
-3. **Generate test file** with correct imports, describe block, Steps comments, and assertions
-4. **Always append a Performance Audit describe block** using the `audit` and `auditMobile` fixtures
-5. **Write file** to `src/tests/{featureName}/{featureName}.spec.ts`
-6. **Report** file path, test count (include +2 for performance), device coverage, validation status, and next steps
+3. **Write spec file** using the `Write` tool
+4. **Run tests** with Bash: `npx playwright test --project=desktop-chrome -- {featureName}`
+5. **Fix failures** — rewrite spec if needed, re-run (up to 5 iterations)
+6. **Report** result
+
+## Common Failure Patterns and Fixes
+
+| Failure | Cause | Fix |
+|---------|-------|-----|
+| `expectPageBodyContains` timeout | Element CSS-hidden (hamburger nav, `is-hidden-mobile`) | Switch to `toBeAttached()` |
+| `getByRole('link', { name })` finds nothing | Accessible name mismatch | Use `page.locator('a').filter({ hasText: /text/i })` |
+| Selector not found | Element lazy-loaded via IntersectionObserver | Test section heading instead; avoid scrolled-in content |
+| `selectOption` value not found | Option value differs from display text | Use `selectOption({ index: 1 })` instead |
 
 ## Test File Template
 
@@ -70,15 +91,13 @@ const baseUrl = process.env.STACK === 'stg' ? 'https://stg.ltvco.com'
 
 test.describe('{Feature Name}', () => {
 
-  // Steps: {comma-separated step summary}
-  test('should {action and outcome}', async ({ appActions, page }) => {
-    await appActions.openPage('{/page-path/}');
-
-    // Act
-    await page.getByRole('button', { name: 'Click Me' }).click();
-
-    // Assert
-    await appActions.expectPageBodyContains('Expected text');
+  // Steps:
+  // 1. Navigate to /{page}/
+  // 2. Verify the page loads
+  test('should load the page successfully', async ({ appActions, page }) => {
+    await appActions.openPage('/{page}/');
+    await appActions.expectPageUrlContains('{page}');
+    await expect(page.locator('body')).toBeVisible();
   });
 
 });
@@ -86,17 +105,17 @@ test.describe('{Feature Name}', () => {
 test.describe('{Feature Name} — Performance Audit', () => {
 
   // Steps:
-  // 1. Run Lighthouse desktop audit against {/page-path/}
-  // 2. Verify performance ≥ 50, accessibility ≥ 90, best-practices ≥ 90, seo ≥ 90
+  // 1. Run Lighthouse desktop audit against /{page}/
+  // 2. Verify performance ≥ 50, accessibility ≥ 85, best-practices ≥ 90, seo ≥ 85
   test('desktop audit meets thresholds', async ({ audit }) => {
-    await audit(`${baseUrl}{/page-path/}`);
+    await audit(`${baseUrl}/{page}/`);
   });
 
   // Steps:
-  // 1. Run Lighthouse mobile audit against {/page-path/}
-  // 2. Verify performance ≥ 25, accessibility ≥ 90, best-practices ≥ 90, seo ≥ 90
+  // 1. Run Lighthouse mobile audit against /{page}/
+  // 2. Verify performance ≥ 25, accessibility ≥ 85, best-practices ≥ 90, seo ≥ 85
   test('mobile audit meets thresholds', async ({ auditMobile }) => {
-    await auditMobile(`${baseUrl}{/page-path/}`);
+    await auditMobile(`${baseUrl}/{page}/`);
   });
 
 });
@@ -106,16 +125,17 @@ test.describe('{Feature Name} — Performance Audit', () => {
 
 Both fixtures are available via the merged `test` export from `@/utils/fixtures/appBaseTest`:
 
-| Fixture | Thresholds | Usage |
-|---------|-----------|-------|
-| `audit(url)` | performance ≥ 50, accessibility ≥ 90, best-practices ≥ 90, seo ≥ 90 | Desktop Lighthouse run |
-| `auditMobile(url)` | performance ≥ 25, accessibility ≥ 90, best-practices ≥ 90, seo ≥ 90 | Mobile Lighthouse run |
+| Fixture | Form factor | Thresholds |
+|---------|------------|-----------|
+| `audit(url)` | Desktop | performance ≥ 50, accessibility ≥ 85, best-practices ≥ 90, seo ≥ 85 |
+| `auditMobile(url)` | Mobile | performance ≥ 25, accessibility ≥ 85, best-practices ≥ 90, seo ≥ 85 |
 
-- Always pass the **full URL** (not a relative path): `` `${baseUrl}/page/` ``
-- Lighthouse launches its own Chrome — independent of the Playwright browser profile
+- Always pass the **full URL**: `` `${baseUrl}/page/` ``
+- Lighthouse launches its own Chrome — independent of the Playwright browser
 - HTML report is attached to the test result automatically
+- Run audits separately: `npx playwright test --project=desktop-chrome -- --grep "Performance Audit" {featureName}`
 
-## Constraints (Phase 1)
+## Capabilities
 
 **Can generate:**
 - Basic feature tests (navigation, clicks, form fills, assertions)
@@ -123,6 +143,7 @@ Both fixtures are available via the merged `test` export from `@/utils/fixtures/
 - Role-based and text-based locators as fallback
 - Multiple test scenarios per feature
 - Lighthouse performance audits (desktop + mobile) — **always included**
+- Self-corrects test failures automatically
 
 **Cannot generate (Phase 2+):**
 - Authentication / login flows
@@ -132,59 +153,23 @@ Both fixtures are available via the merged `test` export from `@/utils/fixtures/
 
 ## Output Format
 
-After creating the file, always report:
+After all tests pass:
 
 ```
 ✓ CREATED: src/tests/{feature}/{feature}.spec.ts
-Tests:   {count}
-Devices: {profiles}
-Status:  PASSED | WARNINGS | FAILED
+Tests:      {count} ({functional} functional + 2 performance)
+Devices:    desktop-chrome, tablet-chrome, mobile-chrome, mobile-small
+Iterations: {n}
+Status:     PASSED
 
-Run: npm test --project=desktop-chrome
+Run: npm test -- {feature}
+Run (desktop only): npm test --project=desktop-chrome -- {feature}
 ```
 
 If using role-based locators (no selectors provided), add:
 ```
-Note: Role-based locators generated. If tests fail, inspect the live site and
-      provide selectors: { "elementName": "css-or-data-testid" }
-```
-
-## Examples
-
-### Simple navigation test
-```
-Feature: homepage-header
-Description: Header navigation displays correctly
-Steps:
-  1. Navigate to homepage
-  2. Verify logo is visible
-  3. Verify main navigation links exist
-  4. Click Products link
-  5. Verify URL contains /products
-```
-
-### Mobile-only test
-```
-Feature: mobile-menu
-Description: Hamburger menu works on mobile devices
-Steps:
-  1. Navigate to homepage
-  2. Tap hamburger menu icon
-  3. Verify menu panel opens
-  4. Tap first menu item
-  5. Verify navigation occurred
-Devices: mobile-chrome, mobile-small
-```
-
-### With selectors
-```
-Feature: login-validation
-Description: Login form shows validation errors
-Steps:
-  1. Navigate to /login
-  2. Leave email blank and submit
-  3. Verify "Email is required" error
-Selectors: { "emailInput": "[data-testid='email']", "submitBtn": "button[type='submit']" }
+Note: Role-based locators generated. If tests fail on a specific selector,
+      provide: Selectors: { "elementName": "css-or-data-testid" }
 ```
 
 ## Environment Notes

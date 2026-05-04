@@ -1,10 +1,28 @@
 # testOrchestration Agent
 
-AI-powered Playwright test generator for lifetimevalue.co. Describe a feature and get a ready-to-run test file covering all 4 device profiles.
+AI-powered Playwright test generator. Describe a feature and the agent writes the spec, runs it, self-corrects on failures, and reports when all tests pass — no manual fixing required.
+
+## How It Works (Agentic Loop)
+
+```
+Your feature description
+       ↓
+  Claude writes spec  ──→  write_file()
+       ↓
+  Claude runs tests   ──→  run_tests()
+       ↓
+  Tests fail?  ──→  Claude reads failures, rewrites spec  ──→  run_tests() again
+       ↓
+  All pass  ──→  Done ✓
+```
+
+The loop runs up to 10 iterations. If all tests pass in iteration 1, the whole process finishes in under a minute.
+
+---
 
 ## Two Ways to Use It
 
-### 1. Claude Code Skill (interactive)
+### 1. Claude Code Skill (interactive chat)
 
 Invoke the skill in Claude Code chat:
 
@@ -20,7 +38,7 @@ Steps:
   4. Verify CTA button is clickable
 ```
 
-Claude generates and writes `src/tests/homepage-banner/homepage-banner.spec.ts` directly.
+Claude generates, writes, runs, and fixes the spec file directly in your workspace.
 
 ### 2. CLI (programmatic / CI)
 
@@ -39,6 +57,8 @@ Or pipe a file:
 npm run generate:test < feature.txt
 cat feature.json | npm run generate:test
 ```
+
+---
 
 ## Input Format
 
@@ -70,6 +90,8 @@ JSON input also accepted:
 }
 ```
 
+---
+
 ## Device Profiles
 
 | Profile | Viewport | Device |
@@ -81,18 +103,35 @@ JSON input also accepted:
 
 Default: all 4. Specify `Devices:` to limit.
 
+---
+
 ## Output
 
 ```
-✓ PASSED: src/tests/homepage-banner/homepage-banner.spec.ts
-   Tests:   4
-   Devices: desktop-chrome, tablet-chrome, mobile-chrome, mobile-small
+Generating: homepage-banner
+Devices:    desktop-chrome, tablet-chrome, mobile-chrome, mobile-small
+
+  [1] write_file(path: "src/tests/homepage-banner/homepage-banner.spec.ts") → Written
+  [1] run_tests(project: "desktop-chrome") → ✗ 2 failed
+  [2] write_file(path: "src/tests/homepage-banner/homepage-banner.spec.ts") → Written
+  [2] run_tests(project: "desktop-chrome") → ✓ 6 passed
+
+────────────────────────────────────────────────────
+ ✓ PASSED: src/tests/homepage-banner/homepage-banner.spec.ts
+   Tests:      6
+   Devices:    desktop-chrome, tablet-chrome, mobile-chrome, mobile-small
+   Iterations: 2
 
   Run:
     1. npm test --project=desktop-chrome
     2. npm test
     3. npx playwright show-report
+────────────────────────────────────────────────────
 ```
+
+> Every generated spec includes a **Performance Audit** describe block with Lighthouse desktop + mobile tests automatically appended.
+
+---
 
 ## Examples
 
@@ -103,7 +142,7 @@ Feature: about-page
 Description: About page loads and displays team section
 Steps:
   1. Navigate to /about
-  2. Verify page heading "About Us" is visible
+  2. Verify page heading is visible
   3. Verify team section exists
   4. Verify at least one team member name is shown
 ```
@@ -117,8 +156,8 @@ Steps:
   1. Navigate to homepage
   2. Tap hamburger menu icon
   3. Verify nav menu slides open
-  4. Tap "Features" link
-  5. Verify URL contains /features
+  4. Tap a nav link
+  5. Verify URL changed
 Devices: mobile-chrome, mobile-small
 ```
 
@@ -147,43 +186,37 @@ Base URL: dev
 Devices: desktop-chrome
 ```
 
-## Workflow: Generate → Run → Fix
+---
 
-```
-1. Generate   →  npm run generate:test < feature.txt
-2. Run        →  npm test --project=desktop-chrome
-3. If failing →  npm run test:headed --project=desktop-chrome
-4. Inspect    →  Right-click element → Inspect → Copy selector
-5. Fix        →  Re-run generate with Selectors: { ... }
-6. Commit     →  npm run precommit && git commit
-```
-
-## Phase 1 Capabilities
+## Capabilities
 
 | Can generate | Cannot generate (Phase 2+) |
 |---|---|
 | Navigation tests | Authentication / login |
 | Click interactions | Test data setup |
 | Form fills | API mocking |
-| Text assertions | Visual regression |
-| URL assertions | Performance audits |
+| Text and URL assertions | Visual regression |
 | Multi-device tests | |
 | Role-based locators | |
+| Lighthouse performance audits | |
+| Self-correcting on test failures | |
+
+---
 
 ## Troubleshooting
 
-**Test fails: element not found**
-Run headed to see what's on the page, then add selectors:
+**Agent keeps failing after multiple iterations**
+Check the test output in `test-results/`. Run headed to see what's on the page:
 ```bash
 npm run test:headed --project=desktop-chrome
-# Inspect element → copy selector → add to Selectors: { }
+# Inspect element → copy selector → re-run with Selectors: { ... }
 ```
 
-**Test fails: text not found**
-Check exact casing and whitespace. Provide the exact string in your step description.
+**Text assertion times out**
+The element may be CSS-hidden (e.g. inside a collapsed mobile nav). The agent handles this automatically by switching to DOM-presence checks — if it doesn't, provide the selector explicitly.
 
 **Wrong URL / 404**
-Verify `Base URL:` matches the right environment. Check `STACK` env var:
+Verify `Base URL:` matches the environment. Check `STACK` env var:
 ```bash
 STACK=dev npm test
 STACK=stg npm test
@@ -192,14 +225,16 @@ STACK=stg npm test
 **Missing `// Steps:` validation error**
 The precommit hook requires `// Steps:` above every `test()`. The agent always generates this — if missing, re-run generation.
 
+---
+
 ## Files
 
 ```
 agent/
 ├── README.md                          ← This file
-├── testOrchestration.ts               ← CLI implementation (npm run generate:test)
-├── .test-generation-instructions.md   ← System prompt used by the agent
-└── mcp.json                           ← MCP server config (Playwright active)
+├── testOrchestration.ts               ← CLI implementation (agentic loop)
+├── .test-generation-instructions.md   ← System prompt: tools, workflow, conventions
+└── mcp.json                           ← MCP server config
 
 .claude/skills/
 └── testOrchestration.md               ← Claude Code skill (/testOrchestration)
